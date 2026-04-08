@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
@@ -59,6 +59,11 @@ function formatDuration(seconds) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// Sanitize filename for Content-Disposition
+function sanitizeFilename(name) {
+  return name.replace(/[^\w\s\-_.()]/g, "").replace(/\s+/g, " ").trim() || "download";
+}
+
 // POST /api/info — get video metadata and available formats
 app.post("/api/info", async (req, res) => {
   const { url } = req.body;
@@ -72,81 +77,105 @@ app.post("/api/info", async (req, res) => {
       "--dump-json",
       "--no-warnings",
       "--no-playlist",
+      "--no-check-certificates",
       url,
-    ], { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
+    ], { timeout: 45000, maxBuffer: 10 * 1024 * 1024 });
 
     const data = JSON.parse(stdout);
     const platform = detectPlatform(url);
 
-    // Build format list
+    // Build format list using yt-dlp's format selection strings
+    // Instead of parsing individual formats, offer preset quality tiers
+    // that yt-dlp can merge (video+audio) at download time
     const formats = [];
-    const seen = new Set();
 
-    if (data.formats) {
+    const hasVideo = data.formats?.some(f => f.vcodec && f.vcodec !== "none");
+    const hasAudio = data.formats?.some(f => f.acodec && f.acodec !== "none");
+
+    if (hasVideo) {
+      // Check which resolutions are actually available
+      const heights = new Set();
       for (const f of data.formats) {
-        // Video formats
-        if (f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.height) {
-          const label = f.height >= 2160 ? "4K" :
-                        f.height >= 1080 ? "1080p" :
-                        f.height >= 720 ? "720p" :
-                        f.height >= 480 ? "480p" : "360p";
-          const key = `video-${label}-${f.ext}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            formats.push({
-              type: "video",
-              quality: label,
-              ext: f.ext,
-              filesize: f.filesize || f.filesize_approx || null,
-              itag: f.format_id,
-              height: f.height,
-            });
-          }
+        if (f.vcodec && f.vcodec !== "none" && f.height) {
+          heights.add(f.height);
         }
+      }
 
-        // Audio-only formats
-        if (f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none")) {
-          const ext = f.ext === "m4a" ? "m4a" : f.ext === "webm" ? "webm" : f.ext;
-          const key = `audio-${ext}-${f.abr || ""}`;
-          if (!seen.has(key) && (ext === "m4a" || ext === "webm" || ext === "mp3")) {
-            seen.add(key);
-            formats.push({
-              type: "audio",
-              quality: f.abr ? `${Math.round(f.abr)}kbps` : "Audio",
-              ext,
-              filesize: f.filesize || f.filesize_approx || null,
-              itag: f.format_id,
-              abr: f.abr || 0,
-            });
+      const tiers = [
+        { label: "4K", height: 2160, format: "bestvideo[height<=2160]+bestaudio/best[height<=2160]" },
+        { label: "1080p", height: 1080, format: "bestvideo[height<=1080]+bestaudio/best[height<=1080]" },
+        { label: "720p", height: 720, format: "bestvideo[height<=720]+bestaudio/best[height<=720]" },
+        { label: "480p", height: 480, format: "bestvideo[height<=480]+bestaudio/best[height<=480]" },
+        { label: "360p", height: 360, format: "bestvideo[height<=360]+bestaudio/best[height<=360]" },
+      ];
+
+      for (const tier of tiers) {
+        // Include this tier if any available height matches or is close
+        const available = [...heights].some(h => h >= tier.height * 0.8 && h <= (tier.height === 2160 ? 4320 : tier.height * 1.3));
+        if (available || tier.height <= Math.max(...heights)) {
+          // Estimate file size from the best matching format
+          let filesize = null;
+          for (const f of data.formats) {
+            if (f.height && f.height >= tier.height * 0.8 && f.height <= tier.height * 1.3) {
+              filesize = f.filesize || f.filesize_approx || filesize;
+            }
           }
+
+          formats.push({
+            type: "video",
+            quality: tier.label,
+            ext: "mp4",
+            filesize,
+            formatStr: tier.format,
+          });
         }
+      }
+
+      // If no tiers matched, add a "Best" option
+      if (formats.length === 0) {
+        formats.push({
+          type: "video",
+          quality: "Best",
+          ext: "mp4",
+          filesize: null,
+          formatStr: "bestvideo+bestaudio/best",
+        });
       }
     }
 
-    // Sort video by height descending, audio by bitrate descending
-    formats.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "video" ? -1 : 1;
-      if (a.type === "video") return (b.height || 0) - (a.height || 0);
-      return (b.abr || 0) - (a.abr || 0);
-    });
+    if (hasAudio) {
+      formats.push({
+        type: "audio",
+        quality: "MP3",
+        ext: "mp3",
+        filesize: null,
+        formatStr: "bestaudio/best",
+      });
+      formats.push({
+        type: "audio",
+        quality: "M4A",
+        ext: "m4a",
+        filesize: null,
+        formatStr: "bestaudio[ext=m4a]/bestaudio/best",
+      });
+    }
 
-    // Deduplicate: keep best per quality label for video
-    const deduped = [];
-    const qualitySeen = new Set();
-    for (const f of formats) {
-      const dedupeKey = f.type === "video" ? `${f.type}-${f.quality}` : `${f.type}-${f.ext}`;
-      if (!qualitySeen.has(dedupeKey)) {
-        qualitySeen.add(dedupeKey);
-        deduped.push(f);
-      }
+    if (formats.length === 0) {
+      // Absolute fallback
+      formats.push({
+        type: "video",
+        quality: "Best",
+        ext: "mp4",
+        filesize: null,
+        formatStr: "best",
+      });
     }
 
     res.json({
       title: data.title || "Untitled",
-      thumbnail: data.thumbnail || null,
       duration: formatDuration(data.duration),
       platform,
-      formats: deduped,
+      formats,
     });
   } catch (err) {
     console.error("Info error:", err.message);
@@ -157,56 +186,133 @@ app.post("/api/info", async (req, res) => {
   }
 });
 
-// POST /api/download — get direct download URL
-app.post("/api/download", async (req, res) => {
-  const { url, itag, ext } = req.body;
+// GET /api/download — stream the video file through the server
+app.get("/api/download", async (req, res) => {
+  const { url, format: formatStr, filename } = req.query;
 
   if (!url || !isValidUrl(url)) {
     return res.status(400).json({ error: "Please provide a valid URL." });
   }
 
-  if (!itag) {
+  if (!formatStr) {
     return res.status(400).json({ error: "Please select a format." });
   }
 
-  try {
-    const { stdout } = await execFileAsync("yt-dlp", [
-      "--get-url",
+  const ext = req.query.ext || "mp4";
+  const safeName = sanitizeFilename(filename || "download") + "." + ext;
+
+  // Determine content type
+  const contentTypes = {
+    mp4: "video/mp4",
+    webm: "video/webm",
+    mkv: "video/x-matroska",
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    ogg: "audio/ogg",
+  };
+  const contentType = contentTypes[ext] || "application/octet-stream";
+
+  // Build yt-dlp args
+  const args = [
+    "-f", formatStr,
+    "--no-warnings",
+    "--no-playlist",
+    "--no-check-certificates",
+    "-o", "-", // output to stdout
+  ];
+
+  // For mp3, extract audio and convert
+  if (ext === "mp3") {
+    args.push("--extract-audio", "--audio-format", "mp3");
+    // When extracting audio with -o -, yt-dlp needs to post-process,
+    // so we pipe through ffmpeg separately
+    args.splice(args.indexOf("--extract-audio"), 2);
+    args.splice(args.indexOf("--audio-format"), 2);
+  }
+
+  // For mp4 output, merge into mp4 container
+  if (ext === "mp4") {
+    args.push("--merge-output-format", "mp4");
+  }
+
+  args.push(url);
+
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+
+  let ytdlp;
+
+  if (ext === "mp3") {
+    // Pipe yt-dlp -> ffmpeg for mp3 conversion
+    ytdlp = spawn("yt-dlp", [
+      "-f", formatStr,
       "--no-warnings",
       "--no-playlist",
-      "-f", String(itag),
+      "--no-check-certificates",
+      "-o", "-",
       url,
-    ], { timeout: 30000 });
+    ]);
 
-    const directUrl = stdout.trim().split("\n")[0];
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", "pipe:0",
+      "-vn",
+      "-ab", "192k",
+      "-f", "mp3",
+      "pipe:1",
+    ]);
 
-    if (!directUrl) {
-      return res.status(404).json({ error: "No downloadable URL found for this format." });
-    }
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+    ffmpeg.stdout.pipe(res);
 
-    // Get filename
-    let filename = "download";
-    try {
-      const { stdout: nameOut } = await execFileAsync("yt-dlp", [
-        "--get-filename",
-        "--no-warnings",
-        "--no-playlist",
-        "-f", String(itag),
-        "-o", `%(title)s.%(ext)s`,
-        url,
-      ], { timeout: 15000 });
-      filename = nameOut.trim() || "download";
-    } catch {
-      // fallback filename
-    }
+    ytdlp.stderr.on("data", (d) => {
+      const msg = d.toString();
+      if (msg.includes("ERROR")) console.error("yt-dlp error:", msg);
+    });
 
-    res.json({ directUrl, filename });
-  } catch (err) {
-    console.error("Download error:", err.message);
-    if (err.killed) {
-      return res.status(504).json({ error: "Request timed out. Please try again." });
-    }
-    res.status(500).json({ error: "Couldn't get download link. Please try a different format." });
+    ffmpeg.stderr.on("data", () => {
+      // ffmpeg outputs progress to stderr, ignore
+    });
+
+    const cleanup = (code) => {
+      if (code && !res.headersSent) {
+        res.status(500).json({ error: "Download failed." });
+      }
+    };
+
+    ytdlp.on("error", () => cleanup(1));
+    ffmpeg.on("error", () => cleanup(1));
+    ffmpeg.on("close", cleanup);
+
+    req.on("close", () => {
+      ytdlp.kill();
+      ffmpeg.kill();
+    });
+  } else {
+    // Direct pipe for video/m4a
+    ytdlp = spawn("yt-dlp", args);
+
+    ytdlp.stdout.pipe(res);
+
+    ytdlp.stderr.on("data", (d) => {
+      const msg = d.toString();
+      if (msg.includes("ERROR")) console.error("yt-dlp error:", msg);
+    });
+
+    ytdlp.on("error", () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Download failed." });
+      }
+    });
+
+    ytdlp.on("close", (code) => {
+      if (code && !res.headersSent) {
+        res.status(500).json({ error: "Download failed." });
+      }
+    });
+
+    req.on("close", () => {
+      ytdlp.kill();
+    });
   }
 });
 
