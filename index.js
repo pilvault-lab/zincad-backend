@@ -3,10 +3,26 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
 
 const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// Common yt-dlp flags used across all calls
+const BASE_ARGS = [
+  "--no-warnings",
+  "--no-playlist",
+  "--no-check-certificates",
+  "--user-agent", USER_AGENT,
+  "--extractor-args", "youtube:player_client=web,default",
+];
 
 app.use(cors());
 app.use(express.json());
@@ -61,7 +77,24 @@ function formatDuration(seconds) {
 
 // Sanitize filename for Content-Disposition
 function sanitizeFilename(name) {
-  return name.replace(/[^\w\s\-_.()]/g, "").replace(/\s+/g, " ").trim() || "download";
+  return name.replace(/[^\w\s\-_.()]/g, "").replace(/\s+/g, "_").trim() || "download";
+}
+
+// Generate a unique temp path
+function tmpPath(ext) {
+  const id = crypto.randomBytes(8).toString("hex");
+  return path.join(os.tmpdir(), `zincad-${id}.${ext}`);
+}
+
+// Delete file silently
+function deleteFile(filepath) {
+  fs.unlink(filepath, () => {});
+  // Also try common merge artifacts
+  const dir = path.dirname(filepath);
+  const base = path.basename(filepath, path.extname(filepath));
+  for (const ext of [".mp4", ".webm", ".mkv", ".m4a", ".mp3", ".part", ".temp"]) {
+    fs.unlink(path.join(dir, base + ext), () => {});
+  }
 }
 
 // POST /api/info — get video metadata and available formats
@@ -75,63 +108,54 @@ app.post("/api/info", async (req, res) => {
   try {
     const { stdout } = await execFileAsync("yt-dlp", [
       "--dump-json",
-      "--no-warnings",
-      "--no-playlist",
-      "--no-check-certificates",
+      ...BASE_ARGS,
       url,
-    ], { timeout: 45000, maxBuffer: 10 * 1024 * 1024 });
+    ], { timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
 
     const data = JSON.parse(stdout);
     const platform = detectPlatform(url);
 
-    // Build format list using yt-dlp's format selection strings
-    // Instead of parsing individual formats, offer preset quality tiers
-    // that yt-dlp can merge (video+audio) at download time
     const formats = [];
 
     const hasVideo = data.formats?.some(f => f.vcodec && f.vcodec !== "none");
     const hasAudio = data.formats?.some(f => f.acodec && f.acodec !== "none");
 
     if (hasVideo) {
-      // Check which resolutions are actually available
       const heights = new Set();
       for (const f of data.formats) {
         if (f.vcodec && f.vcodec !== "none" && f.height) {
           heights.add(f.height);
         }
       }
+      const maxHeight = Math.max(...heights, 0);
 
       const tiers = [
-        { label: "4K", height: 2160, format: "bestvideo[height<=2160]+bestaudio/best[height<=2160]" },
-        { label: "1080p", height: 1080, format: "bestvideo[height<=1080]+bestaudio/best[height<=1080]" },
-        { label: "720p", height: 720, format: "bestvideo[height<=720]+bestaudio/best[height<=720]" },
-        { label: "480p", height: 480, format: "bestvideo[height<=480]+bestaudio/best[height<=480]" },
-        { label: "360p", height: 360, format: "bestvideo[height<=360]+bestaudio/best[height<=360]" },
+        { label: "4K", height: 2160 },
+        { label: "1080p", height: 1080 },
+        { label: "720p", height: 720 },
+        { label: "480p", height: 480 },
+        { label: "360p", height: 360 },
       ];
 
       for (const tier of tiers) {
-        // Include this tier if any available height matches or is close
-        const available = [...heights].some(h => h >= tier.height * 0.8 && h <= (tier.height === 2160 ? 4320 : tier.height * 1.3));
-        if (available || tier.height <= Math.max(...heights)) {
-          // Estimate file size from the best matching format
-          let filesize = null;
-          for (const f of data.formats) {
-            if (f.height && f.height >= tier.height * 0.8 && f.height <= tier.height * 1.3) {
-              filesize = f.filesize || f.filesize_approx || filesize;
-            }
-          }
+        if (tier.height > maxHeight) continue;
 
-          formats.push({
-            type: "video",
-            quality: tier.label,
-            ext: "mp4",
-            filesize,
-            formatStr: tier.format,
-          });
+        let filesize = null;
+        for (const f of data.formats) {
+          if (f.height && Math.abs(f.height - tier.height) <= tier.height * 0.2) {
+            filesize = f.filesize || f.filesize_approx || filesize;
+          }
         }
+
+        formats.push({
+          type: "video",
+          quality: tier.label,
+          ext: "mp4",
+          filesize,
+          formatStr: `bestvideo[height<=${tier.height}]+bestaudio/best[height<=${tier.height}]/best`,
+        });
       }
 
-      // If no tiers matched, add a "Best" option
       if (formats.length === 0) {
         formats.push({
           type: "video",
@@ -161,7 +185,6 @@ app.post("/api/info", async (req, res) => {
     }
 
     if (formats.length === 0) {
-      // Absolute fallback
       formats.push({
         type: "video",
         quality: "Best",
@@ -178,7 +201,7 @@ app.post("/api/info", async (req, res) => {
       formats,
     });
   } catch (err) {
-    console.error("Info error:", err.message);
+    console.error("Info error:", err.stderr || err.message);
     if (err.killed) {
       return res.status(504).json({ error: "Request timed out. Please try again." });
     }
@@ -186,7 +209,7 @@ app.post("/api/info", async (req, res) => {
   }
 });
 
-// GET /api/download — stream the video file through the server
+// GET /api/download — download to temp file, then stream to client
 app.get("/api/download", async (req, res) => {
   const { url, format: formatStr, filename } = req.query;
 
@@ -200,8 +223,8 @@ app.get("/api/download", async (req, res) => {
 
   const ext = req.query.ext || "mp4";
   const safeName = sanitizeFilename(filename || "download") + "." + ext;
+  const outFile = tmpPath(ext);
 
-  // Determine content type
   const contentTypes = {
     mp4: "video/mp4",
     webm: "video/webm",
@@ -212,107 +235,107 @@ app.get("/api/download", async (req, res) => {
   };
   const contentType = contentTypes[ext] || "application/octet-stream";
 
-  // Build yt-dlp args
+  // Build yt-dlp args — download to temp file (handles merge properly)
   const args = [
     "-f", formatStr,
-    "--no-warnings",
-    "--no-playlist",
-    "--no-check-certificates",
-    "-o", "-", // output to stdout
+    ...BASE_ARGS,
+    "-o", outFile,
   ];
 
-  // For mp3, extract audio and convert
-  if (ext === "mp3") {
-    args.push("--extract-audio", "--audio-format", "mp3");
-    // When extracting audio with -o -, yt-dlp needs to post-process,
-    // so we pipe through ffmpeg separately
-    args.splice(args.indexOf("--extract-audio"), 2);
-    args.splice(args.indexOf("--audio-format"), 2);
-  }
-
-  // For mp4 output, merge into mp4 container
+  // For video, force mp4 container after merge
   if (ext === "mp4") {
     args.push("--merge-output-format", "mp4");
   }
 
+  // For mp3, extract audio and convert via ffmpeg
+  if (ext === "mp3") {
+    args.push("--extract-audio", "--audio-format", "mp3");
+    // yt-dlp will create the file with .mp3 extension after conversion
+  }
+
+  // For m4a, extract audio
+  if (ext === "m4a") {
+    args.push("--extract-audio", "--audio-format", "m4a");
+  }
+
   args.push(url);
 
-  res.setHeader("Content-Type", contentType);
-  res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+  let aborted = false;
 
-  let ytdlp;
+  req.on("close", () => {
+    aborted = true;
+    deleteFile(outFile);
+  });
 
-  if (ext === "mp3") {
-    // Pipe yt-dlp -> ffmpeg for mp3 conversion
-    ytdlp = spawn("yt-dlp", [
-      "-f", formatStr,
-      "--no-warnings",
-      "--no-playlist",
-      "--no-check-certificates",
-      "-o", "-",
-      url,
-    ]);
+  console.log(`Download start: ${ext} | ${formatStr} | ${url}`);
 
-    const ffmpeg = spawn("ffmpeg", [
-      "-i", "pipe:0",
-      "-vn",
-      "-ab", "192k",
-      "-f", "mp3",
-      "pipe:1",
-    ]);
+  try {
+    await new Promise((resolve, reject) => {
+      const proc = spawn("yt-dlp", args);
+      let stderr = "";
 
-    ytdlp.stdout.pipe(ffmpeg.stdin);
-    ffmpeg.stdout.pipe(res);
+      proc.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
 
-    ytdlp.stderr.on("data", (d) => {
-      const msg = d.toString();
-      if (msg.includes("ERROR")) console.error("yt-dlp error:", msg);
+      proc.on("close", (code) => {
+        if (aborted) return reject(new Error("Client disconnected"));
+        if (code !== 0) return reject(new Error(stderr || `yt-dlp exited with code ${code}`));
+        resolve();
+      });
+
+      proc.on("error", reject);
+
+      req.on("close", () => {
+        proc.kill();
+      });
     });
 
-    ffmpeg.stderr.on("data", () => {
-      // ffmpeg outputs progress to stderr, ignore
-    });
+    if (aborted) return;
 
-    const cleanup = (code) => {
-      if (code && !res.headersSent) {
-        res.status(500).json({ error: "Download failed." });
+    // yt-dlp may change the extension (e.g. extract-audio creates .mp3 from .webm)
+    // Try to find the actual output file
+    let actualFile = outFile;
+    if (!fs.existsSync(actualFile)) {
+      // Search for file with same base name but different extension
+      const dir = path.dirname(outFile);
+      const base = path.basename(outFile, "." + ext);
+      const candidates = fs.readdirSync(dir).filter(f => f.startsWith(base));
+      if (candidates.length > 0) {
+        actualFile = path.join(dir, candidates[0]);
+      } else {
+        console.error("Output file not found:", outFile);
+        return res.status(500).json({ error: "Download failed — output file not found." });
       }
-    };
+    }
 
-    ytdlp.on("error", () => cleanup(1));
-    ffmpeg.on("error", () => cleanup(1));
-    ffmpeg.on("close", cleanup);
+    const stat = fs.statSync(actualFile);
 
-    req.on("close", () => {
-      ytdlp.kill();
-      ffmpeg.kill();
-    });
-  } else {
-    // Direct pipe for video/m4a
-    ytdlp = spawn("yt-dlp", args);
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+    res.setHeader("Content-Length", stat.size);
 
-    ytdlp.stdout.pipe(res);
+    const stream = fs.createReadStream(actualFile);
+    stream.pipe(res);
 
-    ytdlp.stderr.on("data", (d) => {
-      const msg = d.toString();
-      if (msg.includes("ERROR")) console.error("yt-dlp error:", msg);
+    stream.on("end", () => {
+      deleteFile(actualFile);
     });
 
-    ytdlp.on("error", () => {
+    stream.on("error", (err) => {
+      console.error("Stream error:", err.message);
+      deleteFile(actualFile);
       if (!res.headersSent) {
         res.status(500).json({ error: "Download failed." });
       }
     });
-
-    ytdlp.on("close", (code) => {
-      if (code && !res.headersSent) {
-        res.status(500).json({ error: "Download failed." });
-      }
-    });
-
-    req.on("close", () => {
-      ytdlp.kill();
-    });
+  } catch (err) {
+    deleteFile(outFile);
+    if (aborted) return;
+    console.error("Download error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Download failed. Please try a different format." });
+    }
   }
 });
 
