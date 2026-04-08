@@ -20,9 +20,31 @@ const BASE_ARGS = [
   "--no-warnings",
   "--no-playlist",
   "--no-check-certificates",
+  "--force-ipv4",
   "--user-agent", USER_AGENT,
-  "--extractor-args", "youtube:player_client=web,default",
+  "--socket-timeout", "30",
+  "--retries", "3",
 ];
+
+// Platform-specific extra args
+function platformArgs(url) {
+  const host = new URL(url).hostname.toLowerCase();
+
+  if (host.includes("youtube.com") || host.includes("youtu.be")) {
+    return [
+      "--extractor-args", "youtube:player_client=android,web",
+    ];
+  }
+
+  if (host.includes("instagram.com")) {
+    return [
+      "--add-header", "Referer:https://www.instagram.com/",
+      "--add-header", "X-IG-App-ID:936619743392459",
+    ];
+  }
+
+  return [];
+}
 
 app.use(cors());
 app.use(express.json());
@@ -109,6 +131,7 @@ app.post("/api/info", async (req, res) => {
     const { stdout } = await execFileAsync("yt-dlp", [
       "--dump-json",
       ...BASE_ARGS,
+      ...platformArgs(url),
       url,
     ], { timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
 
@@ -201,11 +224,18 @@ app.post("/api/info", async (req, res) => {
       formats,
     });
   } catch (err) {
-    console.error("Info error:", err.stderr || err.message);
+    const stderr = err.stderr || err.message || "";
+    console.error("Info error:", stderr);
     if (err.killed) {
       return res.status(504).json({ error: "Request timed out. Please try again." });
     }
-    res.status(500).json({ error: "Couldn't fetch video info. The URL may be private, DRM-protected, or unsupported." });
+    // Surface a useful message from yt-dlp if possible
+    const ytdlpError = stderr.match(/ERROR:\s*(.+)/)?.[1];
+    res.status(500).json({
+      error: ytdlpError
+        ? `yt-dlp: ${ytdlpError}`
+        : "Couldn't fetch video info. The URL may be private, DRM-protected, or unsupported.",
+    });
   }
 });
 
@@ -239,6 +269,7 @@ app.get("/api/download", async (req, res) => {
   const args = [
     "-f", formatStr,
     ...BASE_ARGS,
+    ...platformArgs(url),
     "-o", outFile,
   ];
 

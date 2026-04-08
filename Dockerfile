@@ -10,4 +10,4 @@ RUN npm install --production
 COPY . .
 
 EXPOSE 3001
-CMD ["node", "index.js"]
+CMD ["sh", "-c", "pip3 install --break-system-packages -U yt-dlp 2>/dev/null; node index.js"]
